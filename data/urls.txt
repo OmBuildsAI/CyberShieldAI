@@ -1,0 +1,12 @@
+# SAFE
+https://www.github.com
+https://www.python.org
+
+# SUSPICIOUS
+http://tinyurl.com/account-update
+http://bit.ly/secure-verify
+
+# DANGEROUS
+http://45.76.223.12/login.php
+http://192.168.0.1/banking-update
+
