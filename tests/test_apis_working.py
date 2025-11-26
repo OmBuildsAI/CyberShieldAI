@@ -82,7 +82,7 @@ def test_huggingface_deepfake_live():
 
     Skips if Hugging Face token is not configured.
     """
-    hf_token = os.getenv("HUGGINGFACE_API_TOKEN") or os.getenv("HF_API_TOKEN")
+    hf_token = os.getenv("HUGGINGFACE_API_TOKEN") or os.getenv("HF_API_TOKEN") or os.getenv("HUGGINGFACE_API_KEY")
     if not hf_token:
         pytest.skip("Hugging Face token not configured; skipping live test")
 
