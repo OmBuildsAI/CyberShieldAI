@@ -16,11 +16,22 @@ try:
     import cv2
 except Exception:
     cv2 = None
+try:
+    import requests
+except Exception:
+    requests = None
 import io
 import os
 import tempfile
 import re
 import numpy as np
+import time
+import datetime
+
+# Simple in-memory rate limiter timestamps for VirusTotal: list of epoch seconds
+_vt_request_timestamps: List[float] = []
+# max requests per minute
+_VT_RATE_LIMIT = 4
 
 
 def scan_qr_from_pil(image: Image.Image) -> List[str]:
@@ -173,6 +184,25 @@ def scan_qr_code(image_file) -> dict:
         is_url = False
 
     result["is_url"] = is_url
+    # If it's a URL, attempt VirusTotal lookup (if API key present)
+    vt_report = None
+    try:
+        if is_url:
+            # determine VT API key from env
+            vt_api_key = os.getenv('VIRUSTOTAL_API_KEY') or os.getenv('VT_API_KEY')
+            if vt_api_key and requests is not None:
+                try:
+                    vt_report = _vt_analyze_url(data0, vt_api_key)
+                except Exception as e:
+                    vt_report = {"error": f"VirusTotal lookup failed: {e}"}
+            else:
+                vt_report = {"error": "VirusTotal API key not configured or requests missing"}
+    except Exception:
+        vt_report = {"error": "VirusTotal analysis exception"}
+
+    if vt_report is not None:
+        result["vt_report"] = vt_report
+
     return result
 
 
@@ -201,3 +231,115 @@ def generate_test_qr(url: str, filename: str = None) -> str:
         os.close(fd)
         img.save(path)
         return path
+
+
+def _vt_rate_limit_check() -> None:
+    """Raise RuntimeError if the rate limit (4 req/min) would be exceeded."""
+    global _vt_request_timestamps
+    now = time.time()
+    # remove older than 60 seconds
+    _vt_request_timestamps = [t for t in _vt_request_timestamps if now - t < 60]
+    if len(_vt_request_timestamps) >= _VT_RATE_LIMIT:
+        raise RuntimeError("VirusTotal rate limit exceeded (4 requests per minute)")
+
+
+def _vt_analyze_url(url: str, api_key: str, timeout: float = 10.0) -> dict:
+    """Analyze a URL with VirusTotal v3 API. Returns a structured report.
+
+    If the API or requests are unavailable, raises RuntimeError.
+    """
+    if requests is None:
+        raise RuntimeError("`requests` is required for VirusTotal integration")
+
+    # Enforce rate limit
+    _vt_rate_limit_check()
+
+    headers = {"x-apikey": api_key}
+
+    # Submit URL for analysis
+    submit_url = "https://www.virustotal.com/api/v3/urls"
+    resp = requests.post(submit_url, data={"url": url}, headers=headers, timeout=timeout)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"VirusTotal submit failed: {resp.status_code} {resp.text}")
+
+    try:
+        resp_json = resp.json()
+    except Exception as e:
+        raise RuntimeError(f"Invalid JSON from VirusTotal submit: {e}")
+
+    analysis_id = resp_json.get("data", {}).get("id")
+    if not analysis_id:
+        raise RuntimeError("VirusTotal did not return analysis id")
+
+    # record timestamp for rate limiting
+    _vt_request_timestamps.append(time.time())
+
+    # Poll analysis endpoint until complete (or timeout)
+    analysis_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
+    deadline = time.time() + timeout
+    analysis_json = None
+    while time.time() < deadline:
+        r2 = requests.get(analysis_url, headers=headers, timeout=timeout)
+        if r2.status_code != 200:
+            # Accept transient non-200 while polling; break if persistent
+            try:
+                time.sleep(1)
+            except Exception:
+                pass
+            time.sleep(0.5)
+            continue
+        try:
+            analysis_json = r2.json()
+        except Exception:
+            time.sleep(0.5)
+            continue
+
+        status = analysis_json.get("data", {}).get("attributes", {}).get("status")
+        if status == "completed":
+            break
+        time.sleep(0.5)
+
+    if analysis_json is None:
+        raise RuntimeError("VirusTotal analysis fetch failed or timed out")
+
+    # Parse stats
+    attrs = analysis_json.get("data", {}).get("attributes", {})
+    stats = attrs.get("stats", {}) or {}
+
+    positives = int(stats.get("malicious", 0)) + int(stats.get("suspicious", 0))
+    total = sum(int(v) for v in stats.values()) if stats else 0
+    detection_ratio = f"{positives}/{total}" if total else "0/0"
+
+    # confidence heuristic: percent malicious among total signals
+    confidence = int((positives / total) * 100) if total else 0
+
+    # scan date — try known fields
+    scan_ts = attrs.get("date") or attrs.get("end_time") or attrs.get("last_modification_date")
+    scan_date = None
+    if isinstance(scan_ts, (int, float)):
+        try:
+            scan_date = datetime.datetime.utcfromtimestamp(int(scan_ts)).isoformat() + "Z"
+        except Exception:
+            scan_date = None
+    # fallback to header date
+    if not scan_date:
+        scan_date = r2.headers.get("Date") if 'r2' in locals() and hasattr(r2, 'headers') else None
+
+    # safety status
+    if positives > 0:
+        safety_status = "Dangerous"
+    elif int(stats.get("suspicious", 0)) > 0:
+        safety_status = "Suspicious"
+    else:
+        safety_status = "Safe"
+
+    report = {
+        "detection_ratio": detection_ratio,
+        "confidence": confidence,
+        "scan_date": scan_date,
+        "safety_status": safety_status,
+        "raw_stats": stats,
+        "analysis_id": analysis_id,
+        "source": "VirusTotal"
+    }
+    return report
