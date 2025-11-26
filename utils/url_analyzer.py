@@ -1,4 +1,8 @@
+import os
 import re
+import json
+from typing import Dict, Any
+
 try:
     import requests
 except Exception:  # requests may not be available in minimal test envs
@@ -9,7 +13,16 @@ try:
 except Exception:
     validators = None
 
-def _is_ip_in_hostname(url):
+try:
+    # prefer dotenv if available to load `.env`
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    # if python-dotenv is not installed, rely on the environment already being set
+    pass
+
+
+def _is_ip_in_hostname(url: str) -> bool:
     # Quick check whether the netloc is an IP address
     try:
         from urllib.parse import urlparse
@@ -21,225 +34,248 @@ def _is_ip_in_hostname(url):
         return False
 
 
-def analyze_url(url: str) -> dict:
-    """Perform lightweight URL safety heuristics and a status check.
+def _heuristic_assess(url: str) -> Dict[str, Any]:
+    """Return a heuristic assessment (fallback) similar to the previous analyze_url.
 
-    Returns a dict with simple signals. This is not a replacement for
-    a real URL-scanning service — just a starting point.
+    This returns a dict with keys used below when the Google API is unavailable.
     """
     result = {
-        "url": url,
-        "is_valid_format": False,
-        "http_status": None,
-        "suspicious_score": 0,
-        "notes": []
+        "status": "Safe",
+        "message": "No strong suspicious signals found",
+        "risk_score": 0,
+        "risk_factors": [],
+        "confidence": 40,
+        "source": "heuristic"
     }
 
     if not isinstance(url, str) or not url.strip():
-        result["notes"].append("Empty or invalid input")
+        result.update({"status": "Invalid", "message": "Empty or invalid input", "confidence": 0})
         return result
 
     url = url.strip()
-    # Use validators if available, otherwise fall back to a basic check
+    score = 0
+    notes = []
+
+    # simple validations
     if validators is not None:
         try:
-            result["is_valid_format"] = bool(validators.url(url))
+            valid = bool(validators.url(url))
         except Exception:
-            result["is_valid_format"] = False
+            valid = False
     else:
-        # Simple regex-based URL check (not perfect, but avoids hard dependency)
-        result["is_valid_format"] = bool(re.match(r"^https?://[A-Za-z0-9\-\.]+", url))
+        valid = bool(re.match(r"^https?://[A-Za-z0-9\-\.]+", url))
 
-    # Basic heuristics
-    score = 0
-    if len(url) > 100:
+    if not valid:
+        result.update({"status": "Invalid", "message": "URL failed validation", "confidence": 5})
+        return result
+
+    if len(url) > 200:
+        score += 2
+        notes.append("Very long URL")
+    elif len(url) > 100:
         score += 1
-        result["notes"].append("Very long URL")
+        notes.append("Long URL")
+
     if "@" in url:
         score += 2
-        result["notes"].append("Contains @ symbol (often used in phishing)")
-    if url.count("-") > 5:
-        score += 1
-        result["notes"].append("Many hyphens in URL")
+        notes.append("Contains '@' symbol")
+
     if _is_ip_in_hostname(url):
+        score += 3
+        notes.append("Host uses IP address")
+
+    if not url.lower().startswith("https://"):
+        score += 1
+        notes.append("No HTTPS scheme")
+
+    if url.count(".") > 6:
         score += 2
-        result["notes"].append("Host uses IP address instead of domain")
+        notes.append("Many dots in URL")
+    elif url.count(".") > 3:
+        score += 1
+        notes.append("Multiple dots in URL")
 
-    # Try to fetch HEAD to get status code
-    # Try to fetch HEAD to get status code (only if requests is available)
-    if requests is not None:
-        try:
-            resp = requests.head(url, allow_redirects=True, timeout=5)
-            result["http_status"] = resp.status_code
-            if resp.status_code >= 400:
-                score += 1
-                result["notes"].append(f"HTTP status {resp.status_code}")
-        except Exception as e:
-            result["notes"].append(f"HTTP request failed: {e}")
-    else:
-        result["notes"].append("`requests` library not available; skipped HTTP check")
+    keywords = ["login", "verify", "account", "secure", "banking", "update"]
+    found_keywords = [k for k in keywords if k in url.lower()]
+    if found_keywords:
+        score += min(3, len(found_keywords))
+        notes.append(f"Suspicious keywords: {', '.join(found_keywords)}")
 
-    # very naive domain check for suspicious TLDs
+    if any(sd in url.lower() for sd in ["bit.ly", "tinyurl.com", "goo.gl", "t.co", "buff.ly", "ow.ly"]):
+        score += 3
+        notes.append("Shortener domain detected")
+
+    # TLD heuristics
     suspicious_tlds = ['.zip', '.review', '.country', '.kim', '.gq']
     for tld in suspicious_tlds:
         if url.endswith(tld) or (tld in url and url.find(tld) > url.rfind('/')):
             score += 1
-            result["notes"].append(f"Suspicious TLD: {tld}")
+            notes.append(f"Suspicious TLD: {tld}")
 
-    result["suspicious_score"] = score
-    if score >= 4:
-        result["notes"].append("Highly suspicious — use caution")
-    elif score >= 2:
-        result["notes"].append("Suspicious signals present")
-    else:
-        result["notes"].append("No strong suspicious signals found")
+    # Map raw score to the requested 0-10 scale (cap)
+    risk_score = max(0, min(10, score))
 
+    status = "Safe"
+    if risk_score >= 6:
+        status = "Dangerous"
+    elif risk_score >= 3:
+        status = "Suspicious"
+
+    confidence = 60 if status == "Safe" else (50 if status == "Suspicious" else 40)
+
+    result.update({
+        "status": status,
+        "message": "; ".join(notes) if notes else "No strong suspicious signals found",
+        "risk_score": risk_score,
+        "risk_factors": notes,
+        "confidence": confidence,
+        "source": "heuristic"
+    })
     return result
 
 
-def check_phishing(url: str) -> dict:
-    """Rule-based phishing check returning detailed features and risk score.
+def _call_google_safe_browsing(url: str, api_key: str, timeout: float = 5.0) -> Dict[str, Any]:
+    """Call Google Safe Browsing API v4 threatMatches:find and return parsed result.
 
-    Returns a dict with keys:
-    - status: "Safe" | "Suspicious" | "Dangerous" | "Invalid"
-    - risk_score: int
-    - risk_factors: list[str]
-    - features: dict
-    - message: str
+    If `requests` is not available this raises RuntimeError.
     """
-    out = {
-        "status": "Invalid",
-        "risk_score": 0,
-        "risk_factors": [],
-        "features": {},
-        "message": ""
+    if requests is None:
+        raise RuntimeError("`requests` library is required for Google Safe Browsing API calls")
+
+    endpoint = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={api_key}"
+    payload = {
+        "client": {"clientId": "cybershieldai", "clientVersion": "1.0"},
+        "threatInfo": {
+            "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
+            "platformTypes": ["ANY_PLATFORM"],
+            "threatEntryTypes": ["URL"],
+            "threatEntries": [{"url": url}]
+        }
     }
 
-    try:
-        if not isinstance(url, str) or not url.strip():
-            out["message"] = "Empty input"
-            return out
+    resp = requests.post(endpoint, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
 
-        url = url.strip()
 
-        # Validate URL using validators if available
-        is_valid = None
-        if validators is not None:
-            try:
-                is_valid = bool(validators.url(url))
-            except Exception:
-                is_valid = False
-        else:
-            # basic heuristic if validators not installed
-            is_valid = bool(re.match(r"^https?://[A-Za-z0-9\-\.]+", url))
+def analyze_url(url: str) -> Dict[str, Any]:
+    """Assess a URL using Google Safe Browsing when available, else fallback to heuristics.
 
-        if not is_valid:
-            out["status"] = "Invalid"
-            out["message"] = "URL failed validation"
-            return out
+    Returns:
+    {
+        'status': 'Safe'|'Suspicious'|'Dangerous'|'Invalid',
+        'message': 'Detailed explanation',
+        'risk_score': int(0-10),
+        'risk_factors': [ ... ],
+        'confidence': int(0-100),
+        'source': 'Google Safe Browsing API'|'heuristic'
+    }
+    """
+    # Basic input guard
+    if not isinstance(url, str) or not url.strip():
+        return {"status": "Invalid", "message": "Empty input", "risk_score": 0, "risk_factors": [], "confidence": 0, "source": "heuristic"}
 
-        # parse components
-        from urllib.parse import urlparse
-        parsed = urlparse(url)
-        netloc = parsed.netloc or parsed.path
-        # remove credentials if present
-        if "@" in netloc:
-            host = netloc.split("@")[-1]
-        else:
-            host = netloc
-        host = host.split(":")[0]
+    url = url.strip()
 
-        path_and_query = (parsed.path or "") + ("?" + parsed.query if parsed.query else "")
+    # Determine API key from env (check multiple common names)
+    api_key = os.getenv("GOOGLE_SAFE_BROWSING_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GSB_API_KEY")
 
-        features = {}
-        features["url_length"] = len(url)
-        features["has_at_symbol"] = "@" in url
-        features["has_ip"] = _is_ip_in_hostname(url)
-        features["has_https"] = url.lower().startswith("https://")
-        features["num_dots"] = url.count(".")
-        keywords = ["login", "verify", "account", "secure", "banking", "update"]
-        found_keywords = [k for k in keywords if k in url.lower()]
-        features["suspicious_keywords"] = found_keywords
-        short_domain_indicators = ["bit.ly", "tinyurl.com", "goo.gl", "t.co", "buff.ly", "ow.ly"]
-        features["is_short_url"] = any(sd in host.lower() for sd in short_domain_indicators)
-        features["num_hyphens"] = url.count("-")
-        features["domain_length"] = len(host)
+    # Determine legacy `is_valid_format` using validators or regex
+    if validators is not None:
+        try:
+            is_valid_format = bool(validators.url(url))
+        except Exception:
+            is_valid_format = False
+    else:
+        is_valid_format = bool(re.match(r"^https?://[A-Za-z0-9\-\.]+", url))
 
-        # scoring
-        score = 0
-        risk_factors = []
+    # If there's an API key and requests available, try the Google API
+    if api_key:
+        try:
+            data = _call_google_safe_browsing(url, api_key)
+            matches = data.get("matches") if isinstance(data, dict) else None
 
-        # url length
-        if features["url_length"] > 200:
-            score += 2
-            risk_factors.append("Very long URL")
-        elif features["url_length"] > 100:
-            score += 1
-            risk_factors.append("Long URL")
+            if not matches:
+                # No matches -> safe per Google
+                out = {"status": "Safe", "message": "No threats found by Google Safe Browsing.", "risk_score": 0, "risk_factors": [], "confidence": 95, "source": "Google Safe Browsing API"}
+                # Maintain legacy keys for backward compatibility
+                out.update({"is_valid_format": is_valid_format, "suspicious_score": 0, "notes": [out["message"]], "http_status": None})
+                return out
 
-        # @ symbol
-        if features["has_at_symbol"]:
-            score += 2
-            risk_factors.append("Contains '@' symbol")
+            # Parse matches to produce risk factors and score
+            risk_factors = []
+            score = 0
 
-        # IP in hostname
-        if features["has_ip"]:
-            score += 3
-            risk_factors.append("Host uses IP address")
+            severity_map = {
+                "MALWARE": 9,
+                "SOCIAL_ENGINEERING": 7,
+                "UNWANTED_SOFTWARE": 6,
+                "POTENTIALLY_HARMFUL_APPLICATION": 5
+            }
 
-        # HTTPS presence (absence is slightly risky)
-        if not features["has_https"]:
-            score += 1
-            risk_factors.append("No HTTPS scheme")
+            for m in matches:
+                t = m.get("threatType") or m.get("threat", {}).get("threatType")
+                t = t or m.get("threatType")
+                if isinstance(t, str):
+                    risk_factors.append(str(t))
+                    score += severity_map.get(t, 5)
 
-        # number of dots (many subdomains or trickery)
-        if features["num_dots"] > 6:
-            score += 2
-            risk_factors.append("Many dots in URL")
-        elif features["num_dots"] > 3:
-            score += 1
-            risk_factors.append("Multiple dots in URL")
+            # normalize/cap to 0-10
+            risk_score = max(0, min(10, score // 1))
 
-        # suspicious keywords
-        if features["suspicious_keywords"]:
-            # weight by count but cap
-            kw_points = min(3, len(features["suspicious_keywords"]))
-            score += 2 if kw_points >= 1 else 0
-            risk_factors.append(f"Suspicious keywords: {', '.join(features['suspicious_keywords'])}")
-
-        # short URL
-        if features["is_short_url"]:
-            score += 3
-            risk_factors.append("Shortener domain detected")
-
-        # hyphens
-        if features["num_hyphens"] > 6:
-            score += 2
-            risk_factors.append("Many hyphens in URL")
-        elif features["num_hyphens"] > 3:
-            score += 1
-            risk_factors.append("Several hyphens in URL")
-
-        # domain length extreme
-        if features["domain_length"] > 25:
-            score += 1
-            risk_factors.append("Very long domain name")
-
-        # finalize status
-        status = "Safe"
-        if score >= 6:
-            status = "Dangerous"
-        elif score >= 3:
+            # determine status
             status = "Suspicious"
+            if risk_score >= 7:
+                status = "Dangerous"
+            elif risk_score >= 3:
+                status = "Suspicious"
+            else:
+                status = "Safe"
 
-        out["status"] = status
-        out["risk_score"] = score
-        out["risk_factors"] = risk_factors
-        out["features"] = features
-        out["message"] = f"URL assessed as {status}. Follow up on the listed risk factors." if risk_factors else "No strong risk factors found."
-        return out
+            confidence = 90 if status == "Dangerous" else (80 if status == "Suspicious" else 75)
 
-    except Exception as e:
-        out["status"] = "Invalid"
-        out["message"] = f"Error during phishing check: {e}"
-        return out
+            message = f"Google Safe Browsing reported threats: {', '.join(risk_factors)}"
+
+            out = {
+                "status": status,
+                "message": message,
+                "risk_score": int(risk_score),
+                "risk_factors": risk_factors,
+                "confidence": int(confidence),
+                "source": "Google Safe Browsing API"
+            }
+            # Legacy compatibility keys
+            legacy_notes = [message]
+            out.update({"is_valid_format": is_valid_format, "suspicious_score": int(risk_score), "notes": legacy_notes, "http_status": None})
+            return out
+
+        except requests.exceptions.Timeout:
+            # Timeout: fall back to heuristics but surface the error
+            fallback = _heuristic_assess(url)
+            fallback["message"] = "Google Safe Browsing API timeout; heuristic fallback used. " + fallback.get("message", "")
+            fallback["source"] = "heuristic"
+            # add legacy keys
+            fallback.update({"is_valid_format": is_valid_format, "suspicious_score": int(fallback.get("risk_score", 0)), "notes": [fallback.get("message", "")], "http_status": None})
+            return fallback
+        except Exception as e:
+            # Any other API error: include message and fallback
+            fallback = _heuristic_assess(url)
+            fallback["message"] = f"Google Safe Browsing API error: {e}; heuristic fallback used. " + fallback.get("message", "")
+            fallback["source"] = "heuristic"
+            # add legacy keys
+            fallback.update({"is_valid_format": is_valid_format, "suspicious_score": int(fallback.get("risk_score", 0)), "notes": [fallback.get("message", "")], "http_status": None})
+            return fallback
+
+    # No API key or requests not available: use heuristic fallback
+    fallback = _heuristic_assess(url)
+    fallback.update({"is_valid_format": is_valid_format, "suspicious_score": int(fallback.get("risk_score", 0)), "notes": [fallback.get("message", "")], "http_status": None})
+    return fallback
+
+
+def check_phishing(url: str) -> Dict[str, Any]:
+    """Backward-compatible wrapper that returns the same structure as analyze_url.
+
+    This keeps the older `check_phishing` API but simply calls `analyze_url`.
+    """
+    return analyze_url(url)
+
