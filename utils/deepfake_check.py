@@ -10,6 +10,17 @@ except Exception:
     cv2 = None
     np = None
 
+try:
+    import requests
+except Exception:
+    requests = None
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 
 def check_deepfake(video_path: str) -> dict:
     """Legacy placeholder deepfake checker for video files.
@@ -112,8 +123,11 @@ def detect_deepfake(image_file) -> Dict[str, Any]:
         "is_real": False,
         "confidence": 0,
         "num_faces": 0,
-        "analysis": {},
-        "message": ""
+        # `analysis` will be a human-readable summary string; `analysis_details` holds the numeric metrics
+        "analysis": "",
+        "analysis_details": {},
+        "message": "",
+        "source": "heuristic"
     }
 
     # Load image into numpy BGR array if possible
@@ -187,11 +201,121 @@ def detect_deepfake(image_file) -> Dict[str, Any]:
             "artifacts": artifacts
         }
 
-        # Mock realistic detection: 70% chance real, 30% fake
+        result["num_faces"] = int(num_faces)
+        result["face_detected"] = num_faces > 0
+
+        # Image quality analysis (mock/real)
+        if img_array is not None:
+            blur, noise, artifacts = analyze_image_quality(img_array)
+        else:
+            blur, noise, artifacts = (50.0, 15.0, {"blocking": False, "jpeg_artifacts": False})
+
+        result["analysis_details"] = {
+            "blur_score": float(blur),
+            "noise_level": float(noise),
+            "artifacts": artifacts
+        }
+
+        # Try Hugging Face Inference API if token present
+        hf_token = os.getenv("HUGGINGFACE_API_TOKEN") or os.getenv("HF_API_TOKEN")
+        hf_models = [
+            # Candidate models - if not available, code will fall back gracefully
+            "jplu/tf-xlm-roberta-base",
+            "deepfake-detector/deepfake-detection",
+        ]
+
+        best = None
+        if hf_token and requests is not None:
+            # prepare image bytes
+            try:
+                if isinstance(image_file, str) and os.path.exists(image_file):
+                    with open(image_file, "rb") as f:
+                        img_bytes = f.read()
+                else:
+                    try:
+                        img_bytes = image_file.getbuffer()
+                    except Exception:
+                        try:
+                            image_file.seek(0)
+                        except Exception:
+                            pass
+                        img_bytes = image_file.read()
+            except Exception:
+                img_bytes = None
+
+            if img_bytes:
+                headers = {"Authorization": f"Bearer {hf_token}"}
+                for model in hf_models:
+                    try:
+                        url = f"https://api-inference.huggingface.co/models/{model}"
+                        resp = requests.post(url, headers=headers, data=img_bytes, timeout=10)
+                        if resp.status_code != 200:
+                            # try next model
+                            continue
+                        try:
+                            out = resp.json()
+                        except Exception:
+                            # couldn't parse JSON; skip
+                            continue
+
+                        # Interpret common HF response shapes
+                        model_is_real = None
+                        model_conf = None
+                        if isinstance(out, list) and out and isinstance(out[0], dict):
+                            top = max(out, key=lambda x: x.get("score", 0))
+                            label = top.get("label", "")
+                            score = float(top.get("score", 0))
+                            model_conf = int(score * 100)
+                            model_is_real = not ("fake" in label.lower() or "deepfake" in label.lower() or "manipulated" in label.lower())
+                        elif isinstance(out, dict):
+                            if "label" in out and "score" in out:
+                                label = out.get("label", "")
+                                score = float(out.get("score", 0))
+                                model_conf = int(score * 100)
+                                model_is_real = not ("fake" in label.lower() or "deepfake" in label.lower() or "manipulated" in label.lower())
+                            else:
+                                found = False
+                                for v in out.values():
+                                    if isinstance(v, list) and v and isinstance(v[0], dict) and "label" in v[0]:
+                                        top = max(v, key=lambda x: x.get("score", 0))
+                                        label = top.get("label", "")
+                                        score = float(top.get("score", 0))
+                                        model_conf = int(score * 100)
+                                        model_is_real = not ("fake" in label.lower() or "deepfake" in label.lower() or "manipulated" in label.lower())
+                                        found = True
+                                        break
+                                if not found:
+                                    continue
+                        else:
+                            continue
+
+                        candidate = {
+                            "model": model,
+                            "is_real": bool(model_is_real) if model_is_real is not None else None,
+                            "confidence": int(model_conf) if model_conf is not None else None,
+                            "raw": out
+                        }
+                        if best is None or (candidate.get("confidence") or 0) > (best.get("confidence") or 0):
+                            best = candidate
+                    except requests.exceptions.Timeout:
+                        continue
+                    except Exception:
+                        continue
+
+        # If we got a HF candidate, use it
+        if best is not None:
+            result["is_real"] = bool(best.get("is_real", False))
+            result["confidence"] = int(best.get("confidence") or 0)
+            result["analysis"] = f"Model {best.get('model')} predicts {'real' if best.get('is_real') else 'fake'} with confidence {result['confidence']}%"
+            result["analysis_details"] = {"model": best.get("model"), "raw": best.get("raw")}
+            result["message"] = result["analysis"]
+            result["source"] = "Hugging Face AI"
+            return result
+
+        # No HF result: fall back to prior mocked realistic detection
         is_real = random.random() < 0.7
         confidence = random.randint(75, 95)
 
-        # Slightly adjust confidence if faces detected
         if num_faces > 0 and is_real:
             confidence = min(95, confidence + 5)
         if num_faces == 0 and not is_real:
@@ -199,7 +323,9 @@ def detect_deepfake(image_file) -> Dict[str, Any]:
 
         result["is_real"] = bool(is_real)
         result["confidence"] = int(confidence)
+        result["analysis"] = "Heuristic fallback: probabilistic assessment (no HF token or models failed)"
         result["message"] = "Real image detected" if is_real else "Deepfake detected"
+        result["source"] = "heuristic"
 
         return result
     except Exception as e:
